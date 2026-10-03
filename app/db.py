@@ -5,6 +5,8 @@
 - artifacts: 藏品(名称、剩余光照预算、优先级、最低展出时数)
 - locks: 锁定(藏品, 时段) -> 位置('storage' 或展位序号字符串)
 - schedules: 求解历史,保存输入快照与结果,刷新后仍可查看
+- audits: 实测核查,保存核查所用计划(快照要点 + assignment)、实测记录
+  与核查结论,GET 时原样返回,不回改排班
 """
 from __future__ import annotations
 
@@ -56,6 +58,14 @@ CREATE TABLE IF NOT EXISTS schedules (
     transitions INTEGER,
     snapshot TEXT NOT NULL,
     result TEXT
+);
+CREATE TABLE IF NOT EXISTS audits (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at TEXT NOT NULL,
+    schedule_id INTEGER NOT NULL,
+    complete INTEGER NOT NULL,
+    alarm_count INTEGER NOT NULL,
+    report TEXT NOT NULL
 );
 """
 
@@ -295,3 +305,59 @@ def delete_schedule(schedule_id: int) -> bool:
     with _lock, _conn() as c:
         cur = c.execute("DELETE FROM schedules WHERE id = ?", (schedule_id,))
         return cur.rowcount > 0
+
+
+# ---------- 实测核查 ----------
+
+def save_audit(schedule_id: int, report: dict) -> int:
+    """保存一次实测核查。report 须包含核查所用的计划与实测记录,
+
+    之后 GET 原样返回;核查只新增 audits 行,不回改对应排班。
+    """
+    with _lock, _conn() as c:
+        cur = c.execute(
+            "INSERT INTO audits (created_at, schedule_id, complete, alarm_count, report)"
+            " VALUES (?, ?, ?, ?, ?)",
+            (
+                datetime.now().isoformat(timespec="seconds"),
+                schedule_id,
+                1 if report["complete"] else 0,
+                len(report["alarms"]),
+                json.dumps(report, ensure_ascii=False),
+            ),
+        )
+        return cur.lastrowid
+
+
+def get_audit(audit_id: int) -> dict | None:
+    with _lock, _conn() as c:
+        row = c.execute("SELECT * FROM audits WHERE id = ?", (audit_id,)).fetchone()
+    if row is None:
+        return None
+    report = json.loads(row["report"])
+    return {
+        "audit_id": row["id"],
+        "schedule_id": row["schedule_id"],
+        "created_at": row["created_at"],
+        **report,
+    }
+
+
+def list_audits(schedule_id: int) -> list[dict]:
+    """某条排班的核查记录摘要(不含报告正文),按时间倒序。"""
+    with _lock, _conn() as c:
+        rows = c.execute(
+            "SELECT id, created_at, schedule_id, complete, alarm_count"
+            " FROM audits WHERE schedule_id = ? ORDER BY id DESC",
+            (schedule_id,),
+        ).fetchall()
+    return [
+        {
+            "audit_id": r["id"],
+            "schedule_id": r["schedule_id"],
+            "created_at": r["created_at"],
+            "complete": bool(r["complete"]),
+            "alarm_count": r["alarm_count"],
+        }
+        for r in rows
+    ]

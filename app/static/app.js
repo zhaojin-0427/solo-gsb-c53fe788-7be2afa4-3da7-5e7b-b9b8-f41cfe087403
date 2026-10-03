@@ -330,6 +330,7 @@ function renderResult(sched) {
   area.innerHTML = "";
   if (!sched) {
     area.innerHTML = '<p class="hint">尚未求解。设置参数后点击“开始求解”。</p>';
+    renderAudit();
     return;
   }
   const snap = sched.snapshot;
@@ -350,7 +351,7 @@ function renderResult(sched) {
   banner.appendChild(meta);
   area.appendChild(banner);
 
-  if (!res.assignment) return; // 无解 / 超时:无排班可展示
+  if (!res.assignment) { renderAudit(); return; } // 无解 / 超时:无排班可展示
 
   // ---- 展位时间轴 ----
   const h3 = document.createElement("h3");
@@ -481,6 +482,8 @@ function renderResult(sched) {
     c.textContent = text;
     return c;
   }
+
+  renderAudit();
 }
 
 async function solve() {
@@ -543,6 +546,370 @@ function renderSchedules() {
     item.append(title, statusBadge(s.status), meta, spacer, viewBtn, delBtn);
     box.appendChild(item);
   });
+}
+
+/* ---------------- 实测核查 ---------------- */
+
+// 录入状态:按排班 id 隔离,切换排班时重置
+let auditEntry = { scheduleId: null, cells: {}, selected: null };
+let currentAudit = null; // 当前展示的核查报告
+
+function auditLocLabel(loc) {
+  return loc === "storage" ? "库" : `展${loc + 1}`;
+}
+
+function auditLocName(loc) {
+  return loc === "storage" ? "库房" : `展位 ${loc + 1}`;
+}
+
+function cellKey(aid, slot) {
+  return `${aid}:${slot}`;
+}
+
+function renderAudit() {
+  const area = $("#audit-area");
+  area.innerHTML = "";
+  const sched = currentSchedule;
+  if (!sched || !sched.result || !sched.result.assignment) {
+    area.innerHTML =
+      '<p class="hint">在④求解或在⑤历史中查看一个有效排班(最优解 / 可行)后,可在此录入实测并核查。</p>';
+    auditEntry = { scheduleId: null, cells: {}, selected: null };
+    currentAudit = null;
+    return;
+  }
+  if (auditEntry.scheduleId !== sched.id) {
+    auditEntry = { scheduleId: sched.id, cells: {}, selected: null };
+    currentAudit = null;
+  }
+
+  const snap = sched.snapshot;
+  const T = snap.num_slots;
+  const B = snap.booths.length;
+  const arts = snap.artifacts;
+  const assignment = sched.result.assignment;
+
+  // ---- 工具栏 ----
+  const bar = document.createElement("div");
+  bar.className = "solve-bar";
+  const fillBtn = document.createElement("button");
+  fillBtn.className = "small";
+  fillBtn.textContent = "按计划填充";
+  fillBtn.title = "以计划位置与快照照度填满全部时段,再在此基础上修改实测偏差";
+  fillBtn.addEventListener("click", () => {
+    auditEntry.cells = {};
+    arts.forEach((a) => {
+      (assignment[String(a.id)] || []).forEach((loc, t) => {
+        auditEntry.cells[cellKey(a.id, t)] =
+          loc === "storage" ? { location: "storage", lux: 0 } : { location: loc, lux: snap.booths[loc] };
+      });
+    });
+    renderAudit();
+  });
+  const clearBtn = document.createElement("button");
+  clearBtn.className = "small";
+  clearBtn.textContent = "清空实测";
+  clearBtn.addEventListener("click", () => {
+    auditEntry.cells = {};
+    auditEntry.selected = null;
+    renderAudit();
+  });
+  const submitBtn = document.createElement("button");
+  submitBtn.className = "primary small";
+  submitBtn.textContent = "提交核查";
+  const msg = document.createElement("span");
+  msg.className = "meta";
+  bar.append(fillBtn, clearBtn, submitBtn, msg);
+  area.appendChild(bar);
+
+  const hint = document.createElement("p");
+  hint.className = "hint";
+  hint.textContent =
+    "点击单元格选中,在下方编辑器设置实测位置与照度;未填的时段视为缺测(不补零)。核查以排班快照为准,不读取当前配置。";
+  area.appendChild(hint);
+
+  // ---- 选中单元格编辑器 ----
+  if (auditEntry.selected) {
+    const [aid, t] = auditEntry.selected.split(":").map(Number);
+    const art = arts.find((a) => a.id === aid);
+    if (art) {
+      const ed = document.createElement("div");
+      ed.className = "audit-editor";
+      const label = document.createElement("span");
+      label.innerHTML = `<b>${art.name}</b> · 时段 ${t + 1}:`;
+      const locSel = document.createElement("select");
+      [["", "未测"], ...Array.from({ length: B }, (_, b) => [String(b), `展位 ${b + 1}`]), ["storage", "库房"]]
+        .forEach(([v, text]) => {
+          const opt = document.createElement("option");
+          opt.value = v;
+          opt.textContent = text;
+          locSel.appendChild(opt);
+        });
+      const cur = auditEntry.cells[auditEntry.selected];
+      locSel.value = cur === undefined ? "" : String(cur.location);
+      const luxInp = document.createElement("input");
+      luxInp.type = "number";
+      luxInp.className = "num";
+      luxInp.min = 0;
+      luxInp.step = "any";
+      luxInp.style.width = "90px";
+      const syncLux = () => {
+        const c = auditEntry.cells[auditEntry.selected];
+        const isBooth = c && c.location !== "storage";
+        luxInp.style.display = isBooth ? "" : "none";
+        if (isBooth) luxInp.value = c.lux;
+      };
+      locSel.addEventListener("change", () => {
+        if (locSel.value === "") {
+          delete auditEntry.cells[auditEntry.selected];
+        } else if (locSel.value === "storage") {
+          auditEntry.cells[auditEntry.selected] = { location: "storage", lux: 0 };
+        } else {
+          const b = Number(locSel.value);
+          auditEntry.cells[auditEntry.selected] = { location: b, lux: snap.booths[b] };
+        }
+        renderAudit();
+      });
+      luxInp.addEventListener("change", () => {
+        const c = auditEntry.cells[auditEntry.selected];
+        if (!c || c.location === "storage") return;
+        const v = Number(luxInp.value);
+        if (!Number.isFinite(v) || v < 0) { alert("照度须为有限非负数"); return; }
+        c.lux = v;
+        renderAudit();
+      });
+      const luxUnit = document.createElement("span");
+      luxUnit.className = "meta";
+      luxUnit.textContent = "lx";
+      ed.append(label, locSel, luxInp, luxUnit);
+      area.appendChild(ed);
+      syncLux();
+    }
+  }
+
+  // ---- 录入网格 ----
+  const wrap = document.createElement("div");
+  wrap.className = "table-wrap";
+  const table = document.createElement("table");
+  table.className = "audit-grid";
+  const hr = document.createElement("tr");
+  const corner = document.createElement("th");
+  corner.className = "row-head";
+  corner.textContent = "藏品 \\ 时段";
+  hr.appendChild(corner);
+  for (let t = 0; t < T; t++) {
+    const th = document.createElement("th");
+    th.textContent = t + 1;
+    hr.appendChild(th);
+  }
+  table.appendChild(hr);
+  arts.forEach((a) => {
+    const tr = document.createElement("tr");
+    const head = document.createElement("td");
+    head.className = "row-head";
+    head.appendChild(chip(a.name, colorFor(a.id, arts)));
+    tr.appendChild(head);
+    for (let t = 0; t < T; t++) {
+      const key = cellKey(a.id, t);
+      const td = document.createElement("td");
+      td.className = "audit-cell";
+      const c = auditEntry.cells[key];
+      if (c === undefined) {
+        td.classList.add("none");
+      } else {
+        td.innerHTML = c.location === "storage"
+          ? '<span class="tag">库</span>'
+          : `<span class="tag">展${c.location + 1}</span><span class="lux">${fmt(c.lux)}</span>`;
+      }
+      if (auditEntry.selected === key) td.classList.add("selected");
+      td.addEventListener("click", () => {
+        auditEntry.selected = key;
+        renderAudit();
+      });
+      tr.appendChild(td);
+    }
+    table.appendChild(tr);
+  });
+  wrap.appendChild(table);
+  area.appendChild(wrap);
+
+  // ---- 提交 ----
+  submitBtn.addEventListener("click", async () => {
+    const measurements = Object.entries(auditEntry.cells)
+      .map(([key, c]) => {
+        const [aid, slot] = key.split(":").map(Number);
+        return { artifact_id: aid, slot, location: c.location, lux: c.location === "storage" ? 0 : c.lux };
+      })
+      .sort((x, y) => x.artifact_id - y.artifact_id || x.slot - y.slot);
+    submitBtn.disabled = true;
+    msg.textContent = "核查中…";
+    try {
+      currentAudit = await api(`/api/schedules/${sched.id}/audit`, "POST", { measurements });
+      msg.textContent = "";
+      renderAudit();
+    } catch (e) {
+      msg.textContent = "核查失败:" + e.message;
+    } finally {
+      submitBtn.disabled = false;
+    }
+  });
+
+  // ---- 核查报告 ----
+  if (currentAudit) area.appendChild(renderAuditReport(currentAudit));
+
+  // ---- 该排班的历史核查 ----
+  const listBox = document.createElement("div");
+  listBox.className = "audit-history";
+  area.appendChild(listBox);
+  api(`/api/schedules/${sched.id}/audits`).then((audits) => {
+    if (auditEntry.scheduleId !== sched.id) return; // 已切换排班
+    listBox.innerHTML = "";
+    if (!audits.length) return;
+    const h = document.createElement("h3");
+    h.textContent = "历史核查";
+    h.style.fontSize = "15px";
+    listBox.appendChild(h);
+    audits.forEach((au) => {
+      const item = document.createElement("div");
+      item.className = "sched-item";
+      const title = document.createElement("span");
+      title.innerHTML = `<b>核查 #${au.audit_id}</b> <span class="meta">${au.created_at}</span>`;
+      const badge = document.createElement("span");
+      badge.className = `badge ${au.complete ? "optimal" : "unknown"}`;
+      badge.textContent = au.complete ? "完整" : "不完整";
+      const meta = document.createElement("span");
+      meta.className = "meta";
+      meta.textContent = `告警 ${au.alarm_count} 条`;
+      const spacer = document.createElement("span");
+      spacer.className = "spacer";
+      const viewBtn = document.createElement("button");
+      viewBtn.className = "small";
+      viewBtn.textContent = "查看";
+      viewBtn.addEventListener("click", async () => {
+        currentAudit = await api(`/api/audits/${au.audit_id}`);
+        renderAudit();
+        $("#audit-card").scrollIntoView({ behavior: "smooth" });
+      });
+      item.append(title, badge, meta, spacer, viewBtn);
+      listBox.appendChild(item);
+    });
+  }).catch(() => { /* 列表加载失败不影响录入 */ });
+}
+
+const ALARM_TEXT = {
+  over_budget: (al) =>
+    `超预算:「${al.artifact_name}」已测剂量 ${fmt(al.measured_dose)} lx·h 超过预算 ${fmt(al.budget)} lx·h`,
+  unplanned_booth: (al) =>
+    `计划外展位:「${al.artifact_name}」时段 ${al.slot + 1} 计划${auditLocName(al.planned_location)},实测在${auditLocName(al.measured_location)}`,
+  cross_booth: (al) =>
+    `跨展位未隔库:「${al.artifact_name}」时段 ${al.slots[0] + 1}→${al.slots[1] + 1} 由${auditLocName(al.from)}直接移至${auditLocName(al.to)}`,
+  missing: (al) =>
+    `缺测:「${al.artifact_name}」缺 ${al.slots.length} 个时段(${al.slots.slice(0, 8).map((t) => t + 1).join("、")}${al.slots.length > 8 ? "…" : ""}),完整剂量与余额未知`,
+};
+
+function renderAuditReport(audit) {
+  const box = document.createElement("div");
+  box.className = "audit-report";
+
+  const banner = document.createElement("div");
+  banner.className = "result-banner";
+  const badge = document.createElement("span");
+  badge.className = `badge ${audit.complete ? "optimal" : "unknown"}`;
+  badge.textContent = audit.complete ? "完整:全部时段均有实测" : "不完整:存在缺测时段";
+  banner.appendChild(badge);
+  const meta = document.createElement("div");
+  meta.className = "result-meta";
+  meta.innerHTML =
+    `<span>核查 #${audit.audit_id} · ${audit.created_at}</span>` +
+    `<span>排班 #${audit.schedule_id}</span>` +
+    `<span>告警 <b>${audit.alarms.length}</b> 条</span>`;
+  banner.appendChild(meta);
+  box.appendChild(banner);
+
+  // ---- 告警 ----
+  if (audit.alarms.length) {
+    const ul = document.createElement("ul");
+    ul.className = "alarm-list";
+    audit.alarms.forEach((al) => {
+      const li = document.createElement("li");
+      li.className = `alarm ${al.type}`;
+      li.textContent = (ALARM_TEXT[al.type] || ((x) => x.type))(al);
+      ul.appendChild(li);
+    });
+    box.appendChild(ul);
+  } else {
+    const p = document.createElement("p");
+    p.className = "hint";
+    p.textContent = "无告警。";
+    box.appendChild(p);
+  }
+
+  // ---- 逐件剂量汇总 ----
+  const wrap = document.createElement("div");
+  wrap.className = "table-wrap";
+  const t1 = document.createElement("table");
+  t1.innerHTML =
+    "<thead><tr><th>藏品</th><th>计划剂量 (lx·h)</th><th>已测剂量 (lx·h)</th><th>完整剂量</th>" +
+    "<th>预算 (lx·h)</th><th>余额 (lx·h)</th><th>已测时段</th><th>缺测</th><th>差异</th><th>跨展位</th></tr></thead>";
+  const tb = document.createElement("tbody");
+  audit.artifacts.forEach((ar) => {
+    const tr = document.createElement("tr");
+    if (ar.over_budget) tr.className = "over-budget";
+    const cells = [
+      ar.name,
+      fmt(ar.planned_dose),
+      fmt(ar.measured_dose),
+      ar.dose_complete ? fmt(ar.measured_dose) : "未知",
+      fmt(ar.budget),
+      ar.dose_complete ? fmt(ar.balance) : `≤ ${fmt(ar.balance_upper)}(上界)`,
+      `${ar.measured_slots} / ${ar.measured_slots + ar.missing_slots.length}`,
+      ar.missing_slots.length ? `${ar.missing_slots.length} 段` : "—",
+      ar.differences.length ? `${ar.differences.length} 段` : "—",
+      ar.cross_booth.length ? `${ar.cross_booth.length} 处` : "—",
+    ];
+    cells.forEach((text, i) => {
+      const td = document.createElement("td");
+      if (i === 0) {
+        td.appendChild(chip(ar.name, colorFor(ar.artifact_id, audit.plan.artifacts)));
+      } else {
+        td.textContent = text;
+      }
+      tr.appendChild(td);
+    });
+    tb.appendChild(tr);
+  });
+  t1.appendChild(tb);
+  wrap.appendChild(t1);
+  box.appendChild(wrap);
+
+  // ---- 计划 / 实测对照条 ----
+  const h = document.createElement("h3");
+  h.textContent = "计划 / 实测对照";
+  h.style.fontSize = "15px";
+  box.appendChild(h);
+  const legend = document.createElement("p");
+  legend.className = "hint";
+  legend.textContent = "绿=与计划一致 红=与计划不符 灰=缺测(未知);悬停查看详情。";
+  box.appendChild(legend);
+  audit.artifacts.forEach((ar) => {
+    const strip = document.createElement("div");
+    strip.className = "audit-strip";
+    const name = document.createElement("span");
+    name.className = "strip-name";
+    name.appendChild(chip(ar.name, colorFor(ar.artifact_id, audit.plan.artifacts)));
+    strip.appendChild(name);
+    ar.slots.forEach((s) => {
+      const cell = document.createElement("span");
+      cell.className = `strip-cell ${s.status}`;
+      cell.textContent = s.status === "missing" ? "?" : auditLocLabel(s.measured_location);
+      const measured = s.status === "missing"
+        ? "缺测"
+        : `${auditLocName(s.measured_location)} ${fmt(s.measured_lux)} lx`;
+      cell.title = `时段 ${s.slot + 1}\n计划:${auditLocName(s.planned_location)} ${fmt(s.planned_lux)} lx\n实测:${measured}`;
+      strip.appendChild(cell);
+    });
+    box.appendChild(strip);
+  });
+  return box;
 }
 
 /* ---------------- 启动 ---------------- */

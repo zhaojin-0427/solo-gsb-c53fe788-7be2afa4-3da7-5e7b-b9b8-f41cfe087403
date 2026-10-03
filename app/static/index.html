@@ -53,10 +53,15 @@
     <h2>⑤ 历史排班</h2>
     <div id="schedules-list"></div>
   </section>
+
+  <section class="card" id="audit-card">
+    <h2>⑥ 实测核查</h2>
+    <div id="audit-area"><p class="hint">在④求解或在⑤历史中查看一个有效排班(最优解 / 可行)后,可在此录入实测并核查。</p></div>
+  </section>
 </main>
 
 <footer>
-  <p>约束:每件每时段恰在一个展位或库房 · 库房不耗光照 · 展位剂量 = 照度 × 小时,不超预算 · 跨展位移动须间隔至少一小时库房</p>
+  <p>约束:每件每时段恰在一个展位或库房 · 库房不耗光照 · 展位剂量 = 照度 × 小时,不超预算 · 跨展位移动须间隔至少一小时库房 · 实测核查以排班快照为准,缺测不补零</p>
 </footer>
 
 <script src="/static/app.js"></script>

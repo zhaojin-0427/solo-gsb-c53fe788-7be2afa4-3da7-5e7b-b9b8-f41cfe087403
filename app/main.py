@@ -10,6 +10,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from . import db
+from .audit import run_audit
 from .solver import solve_schedule
 
 SOLVE_TIME_LIMIT = 10.0  # 求解限时 10 秒
@@ -44,6 +45,20 @@ class LockIn(BaseModel):
     slot: int = Field(ge=0, le=db.MAX_SLOTS - 1)
     # 'storage'、展位序号(0 起),null 表示清除锁定
     location: Optional[Literal["storage"] | int] = None
+
+
+class MeasurementIn(BaseModel):
+    artifact_id: int
+    slot: int = Field(ge=0)
+    # 'storage' 或展位序号(0 起),须在快照展位范围内
+    location: Literal["storage"] | int
+    # 库房必须为 0;展位为有限非负(由 allow_inf_nan=False 保证有限)
+    lux: float = Field(ge=0, allow_inf_nan=False)
+
+
+class AuditIn(BaseModel):
+    # 唯一合法记录至多 藏品上限 x 时段上限 条,超出必然含重复
+    measurements: list[MeasurementIn] = Field(max_length=db.MAX_ARTIFACTS * db.MAX_SLOTS)
 
 
 # ---------- 页面 ----------
@@ -153,6 +168,74 @@ def del_schedule(schedule_id: int) -> dict:
     if not db.delete_schedule(schedule_id):
         raise HTTPException(404, "排班不存在")
     return {"ok": True}
+
+
+# ---------- 实测核查 ----------
+
+@app.post("/api/schedules/{schedule_id}/audit", status_code=201)
+def post_audit(schedule_id: int, body: AuditIn) -> dict:
+    sched = db.get_schedule(schedule_id)
+    if sched is None:
+        raise HTTPException(404, "排班不存在")
+    result = sched.get("result") or {}
+    assignment = result.get("assignment")
+    if sched["status"] not in ("optimal", "feasible") or not assignment:
+        raise HTTPException(
+            409,
+            "该排班无有效求解结果(状态非 optimal/feasible 或无 assignment),无法核查",
+        )
+    snapshot = sched["snapshot"]
+    artifacts_by_id = {a["id"]: a for a in snapshot["artifacts"]}
+    if any(str(aid) not in assignment for aid in artifacts_by_id):
+        raise HTTPException(409, "排班结果的 assignment 不完整,无法核查")
+
+    # 校验实测记录:藏品、时段、展位均以快照为准,不看当前配置
+    num_slots = snapshot["num_slots"]
+    num_booths = len(snapshot["booths"])
+    seen = set()
+    measurements = []
+    for m in body.measurements:
+        if m.artifact_id not in artifacts_by_id:
+            raise HTTPException(400, f"藏品 {m.artifact_id} 不在排班 #{schedule_id} 的快照中")
+        if m.slot >= num_slots:
+            raise HTTPException(400, f"时段 {m.slot} 超出快照范围(0~{num_slots - 1})")
+        loc = m.location
+        if loc != "storage" and not 0 <= loc < num_booths:
+            raise HTTPException(400, f"位置仅允许 'storage' 或快照展位序号 0~{num_booths - 1}")
+        if loc == "storage" and m.lux != 0:
+            raise HTTPException(400, "库房照度必须为 0 lx")
+        key = (m.artifact_id, m.slot)
+        if key in seen:
+            raise HTTPException(400, f"藏品 {m.artifact_id} 在时段 {m.slot} 存在重复实测记录")
+        seen.add(key)
+        lux = m.lux
+        if isinstance(lux, float) and lux.is_integer():
+            lux = int(lux)
+        measurements.append({
+            "artifact_id": m.artifact_id,
+            "slot": m.slot,
+            "location": loc,
+            "lux": lux if loc != "storage" else 0,
+        })
+
+    report = run_audit(snapshot, assignment, measurements)
+    audit_id = db.save_audit(schedule_id, report)
+    return db.get_audit(audit_id)
+
+
+@app.get("/api/schedules/{schedule_id}/audits")
+def get_schedule_audits(schedule_id: int) -> list[dict]:
+    if db.get_schedule(schedule_id) is None:
+        raise HTTPException(404, "排班不存在")
+    return db.list_audits(schedule_id)
+
+
+@app.get("/api/audits/{audit_id}")
+def get_audit(audit_id: int) -> dict:
+    audit = db.get_audit(audit_id)
+    if audit is None:
+        raise HTTPException(404, "核查记录不存在")
+    return audit
 
 
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
