@@ -53,6 +53,26 @@
     <h2>⑤ 历史排班</h2>
     <div id="schedules-list"></div>
   </section>
+
+  <section class="card" id="audit-card">
+    <h2>⑥ 实测核查</h2>
+    <p class="hint">
+      按某次排班的<b>保存快照与计划</b>(不看当前配置)核查巡场实测:逐槽记录藏品的实测位置与照度,
+      库房照度为 0,展位照度非负。报告超预算、计划外展位、跨展位未隔库与缺测;
+      缺测不补零,完整剂量与真实余额未知,仅给出已测剂量与「预算 − 已测剂量」的余额上界。
+      仅相邻两槽<b>都有实测</b>时才判定跨展位;有缺测时报告标记为不完整。
+    </p>
+    <div class="form-row" id="audit-form"></div>
+    <div class="table-wrap" id="audit-pending-wrap" style="margin-top:12px;"></div>
+    <div class="solve-bar" style="margin-top:10px;">
+      <button id="audit-submit" class="primary">提交核查</button>
+      <span id="audit-msg"></span>
+      <span class="spacer" style="flex:1;"></span>
+      <input type="number" id="audit-load-id" min="1" placeholder="已有 audit_id" style="width:130px;">
+      <button id="audit-load-btn" class="small">按 ID 查看</button>
+    </div>
+    <div id="audit-result" style="margin-top:14px;"></div>
+  </section>
 </main>
 
 <footer>

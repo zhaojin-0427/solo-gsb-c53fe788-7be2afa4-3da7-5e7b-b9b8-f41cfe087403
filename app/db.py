@@ -5,6 +5,7 @@
 - artifacts: 藏品(名称、剩余光照预算、优先级、最低展出时数)
 - locks: 锁定(藏品, 时段) -> 位置('storage' 或展位序号字符串)
 - schedules: 求解历史,保存输入快照与结果,刷新后仍可查看
+- audits: 实测核查,保存提交的记录与基于排班快照/assignment 的核查报告
 """
 from __future__ import annotations
 
@@ -56,6 +57,13 @@ CREATE TABLE IF NOT EXISTS schedules (
     transitions INTEGER,
     snapshot TEXT NOT NULL,
     result TEXT
+);
+CREATE TABLE IF NOT EXISTS audits (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    schedule_id INTEGER NOT NULL REFERENCES schedules(id) ON DELETE CASCADE,
+    created_at TEXT NOT NULL,
+    records TEXT NOT NULL,
+    report TEXT NOT NULL
 );
 """
 
@@ -295,3 +303,39 @@ def delete_schedule(schedule_id: int) -> bool:
     with _lock, _conn() as c:
         cur = c.execute("DELETE FROM schedules WHERE id = ?", (schedule_id,))
         return cur.rowcount > 0
+
+
+# ---------- 实测核查 ----------
+
+def save_audit(schedule_id: int, records: list[dict], report: dict) -> int:
+    """保存一次实测核查:提交的计划外/实测记录与核查报告原样落库。
+
+    核查只读取排班保存的快照与 assignment,不改排班本身;排班被删除时
+    其核查报告一并删除。
+    """
+    with _lock, _conn() as c:
+        cur = c.execute(
+            "INSERT INTO audits (schedule_id, created_at, records, report)"
+            " VALUES (?, ?, ?, ?)",
+            (
+                schedule_id,
+                datetime.now().isoformat(timespec="seconds"),
+                json.dumps(records, ensure_ascii=False),
+                json.dumps(report, ensure_ascii=False),
+            ),
+        )
+        return cur.lastrowid
+
+
+def get_audit(audit_id: int) -> dict | None:
+    with _lock, _conn() as c:
+        row = c.execute("SELECT * FROM audits WHERE id = ?", (audit_id,)).fetchone()
+    if row is None:
+        return None
+    return {
+        "id": row["id"],
+        "schedule_id": row["schedule_id"],
+        "created_at": row["created_at"],
+        "records": json.loads(row["records"]),
+        "report": json.loads(row["report"]),
+    }

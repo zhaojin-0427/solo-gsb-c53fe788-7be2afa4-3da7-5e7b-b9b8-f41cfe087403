@@ -22,12 +22,18 @@ async function api(path, method = "GET", body = null) {
   }
   const resp = await fetch(path, opts);
   if (!resp.ok) {
-    let detail = resp.statusText;
+    let detail = `${resp.status} ${resp.statusText}`;
     try {
       const data = await resp.json();
-      if (data.detail) detail = typeof data.detail === "string" ? data.detail : JSON.stringify(data.detail);
+      if (data.detail) {
+        detail = typeof data.detail === "string"
+          ? data.detail
+          : (data.detail[0] && data.detail[0].msg ? data.detail[0].msg : JSON.stringify(data.detail));
+      }
     } catch (_) { /* ignore */ }
-    throw new Error(detail);
+    const err = new Error(detail);
+    err.status = resp.status;
+    throw err;
   }
   return resp.json();
 }
@@ -475,12 +481,6 @@ function renderResult(sched) {
   t2.appendChild(tb);
   wrap2.appendChild(t2);
   area.appendChild(wrap2);
-
-  function td(text) {
-    const c = document.createElement("td");
-    c.textContent = text;
-    return c;
-  }
 }
 
 async function solve() {
@@ -545,6 +545,441 @@ function renderSchedules() {
   });
 }
 
+/* ---------------- 实测核查 ---------------- */
+
+let auditScheduleId = null;          // 当前选中要核查的排班
+let auditScheduleCache = {};         // id -> 完整排班(含 snapshot)
+let pendingRecords = [];             // 待提交的实测记录
+let currentAudit = null;             // 当前展示的核查报告
+
+function locLabel(loc) {
+  return loc === "storage" ? "库房" : `展位${loc + 1}`;
+}
+
+function fmtDose(n) {
+  if (n === null || n === undefined) return "—";
+  return Number.isInteger(n) ? fmt(n) : Number(n).toLocaleString("zh-CN", { maximumFractionDigits: 2 });
+}
+
+function td(text) {
+  const c = document.createElement("td");
+  c.textContent = text;
+  return c;
+}
+
+async function loadAuditSchedule(id) {
+  if (!auditScheduleCache[id]) auditScheduleCache[id] = await api(`/api/schedules/${id}`);
+  return auditScheduleCache[id];
+}
+
+async function renderAuditForm() {
+  const box = $("#audit-form");
+  box.innerHTML = "";
+  const wrap = $("#audit-pending-wrap");
+  wrap.innerHTML = "";
+  if (!state.schedules.length) {
+    box.innerHTML = '<p class="hint">暂无排班,请先求解并保存一份 optimal / feasible 排班。</p>';
+    return;
+  }
+  const auditable = state.schedules.filter((s) => s.status === "optimal" || s.status === "feasible");
+  if (!auditable.length) {
+    box.innerHTML = '<p class="hint">现有排班均为无解/超时状态,没有可核查的 assignment,请先求得一份 optimal / feasible 排班。</p>';
+    return;
+  }
+  const auditableIds = new Set(auditable.map((s) => s.id));
+  if (auditScheduleId === null || !auditableIds.has(auditScheduleId)) {
+    const cur = currentSchedule && currentSchedule.id;
+    auditScheduleId = cur && auditableIds.has(cur) ? cur : auditable[0].id;
+  }
+
+  // 排班选择
+  const selField = document.createElement("div");
+  selField.className = "field";
+  selField.innerHTML = "<label>核查排班(按其保存快照)</label>";
+  const schedSel = document.createElement("select");
+  state.schedules.forEach((s) => {
+    const opt = document.createElement("option");
+    opt.value = s.id;
+    const auditable = s.status === "optimal" || s.status === "feasible";
+    opt.textContent = `#${s.id} ${STATUS_TEXT[s.status] || s.status}${auditable ? "" : "(不可核查)"}`;
+    if (!auditable) opt.disabled = true;
+    schedSel.appendChild(opt);
+  });
+  schedSel.value = auditScheduleId;
+  selField.appendChild(schedSel);
+
+  const sched = await loadAuditSchedule(auditScheduleId);
+  const snap = sched.snapshot;
+  const arts = snap.artifacts;
+
+  // 藏品选择
+  const artField = document.createElement("div");
+  artField.className = "field";
+  artField.innerHTML = "<label>藏品</label>";
+  const artSel = document.createElement("select");
+  arts.forEach((a) => {
+    const opt = document.createElement("option");
+    opt.value = a.id;
+    opt.textContent = a.name;
+    artSel.appendChild(opt);
+  });
+  artField.appendChild(artSel);
+
+  // 槽位选择
+  const slotField = document.createElement("div");
+  slotField.className = "field";
+  slotField.innerHTML = `<label>槽位(1~${snap.num_slots},1 小时/槽)</label>`;
+  const slotSel = document.createElement("select");
+  for (let t = 0; t < snap.num_slots; t++) {
+    const opt = document.createElement("option");
+    opt.value = t;
+    opt.textContent = `第 ${t + 1} 槽`;
+    slotSel.appendChild(opt);
+  }
+  slotField.appendChild(slotSel);
+
+  // 位置选择
+  const locField = document.createElement("div");
+  locField.className = "field";
+  locField.innerHTML = "<label>实测位置</label>";
+  const locSel = document.createElement("select");
+  const locStorage = document.createElement("option");
+  locStorage.value = "storage";
+  locStorage.textContent = "库房";
+  locSel.appendChild(locStorage);
+  snap.booths.forEach((lx, b) => {
+    const opt = document.createElement("option");
+    opt.value = b;
+    opt.textContent = `展位${b + 1}(${fmt(lx)} lx)`;
+    locSel.appendChild(opt);
+  });
+  locField.appendChild(locSel);
+
+  // 实测照度
+  const luxField = document.createElement("div");
+  luxField.className = "field";
+  luxField.innerHTML = '<label>实测照度 (lx,非负;库房为 0)</label>';
+  const luxInput = document.createElement("input");
+  luxInput.type = "number";
+  luxInput.className = "num";
+  luxInput.min = 0;
+  luxInput.value = 0;
+  luxInput.disabled = true; // 默认库房:强制 0
+  luxField.appendChild(luxInput);
+
+  locSel.addEventListener("change", () => {
+    if (locSel.value === "storage") {
+      luxInput.value = 0;
+      luxInput.disabled = true;
+    } else {
+      luxInput.disabled = false;
+      const b = Number(locSel.value);
+      luxInput.value = snap.booths[b];
+    }
+  });
+
+  const addBtn = document.createElement("button");
+  addBtn.className = "primary";
+  addBtn.textContent = "加入记录";
+
+  addBtn.addEventListener("click", () => {
+    const aid = Number(artSel.value);
+    const slot = Number(slotSel.value);
+    const isStorage = locSel.value === "storage";
+    const location = isStorage ? "storage" : Number(locSel.value);
+    const lux = isStorage ? 0 : Number(luxInput.value);
+    if (!isStorage && (!Number.isFinite(lux) || lux < 0)) {
+      alert("展位实测照度须为非负有限数字");
+      return;
+    }
+    if (pendingRecords.some((r) => r.artifact_id === aid && r.slot === slot)) {
+      alert(`「${arts.find((a) => a.id === aid).name}」第 ${slot + 1} 槽已记录,请勿重复提交`);
+      return;
+    }
+    pendingRecords.push({ artifact_id: aid, slot, location, lux: isStorage ? 0 : lux });
+    renderPending();
+  });
+
+  schedSel.addEventListener("change", async () => {
+    auditScheduleId = Number(schedSel.value);
+    pendingRecords = []; // 待提交记录只对当前快照有效
+    await renderAuditForm();
+  });
+
+  box.append(selField, artField, slotField, locField, luxField, addBtn);
+  renderPending();
+}
+
+function renderPending() {
+  const wrap = $("#audit-pending-wrap");
+  wrap.innerHTML = "";
+  if (!pendingRecords.length) return;
+  const sched = auditScheduleCache[auditScheduleId];
+  const nameOf = (id) => {
+    const a = sched.snapshot.artifacts.find((x) => x.id === id);
+    return a ? a.name : `#${id}`;
+  };
+  const table = document.createElement("table");
+  table.innerHTML =
+    "<thead><tr><th>藏品</th><th>槽位</th><th>实测位置</th><th>照度 (lx)</th><th>操作</th></tr></thead>";
+  const tb = document.createElement("tbody");
+  pendingRecords
+    .slice()
+    .sort((a, b) => a.artifact_id - b.artifact_id || a.slot - b.slot)
+    .forEach((r) => {
+      const tr = document.createElement("tr");
+      const del = document.createElement("button");
+      del.className = "small danger";
+      del.textContent = "移除";
+      del.addEventListener("click", () => {
+        pendingRecords = pendingRecords.filter(
+          (x) => !(x.artifact_id === r.artifact_id && x.slot === r.slot)
+        );
+        renderPending();
+      });
+      const opTd = document.createElement("td");
+      opTd.appendChild(del);
+      [nameOf(r.artifact_id), `第 ${r.slot + 1} 槽`, locLabel(r.location), fmtDose(r.lux)]
+        .forEach((v) => {
+          const td = document.createElement("td");
+          td.textContent = v;
+          tr.appendChild(td);
+        });
+      tr.appendChild(opTd);
+      tb.appendChild(tr);
+    });
+  table.appendChild(tb);
+  wrap.appendChild(table);
+}
+
+async function submitAudit() {
+  const btn = $("#audit-submit");
+  const msg = $("#audit-msg");
+  if (!pendingRecords.length) {
+    alert("请先加入至少一条实测记录");
+    return;
+  }
+  btn.disabled = true;
+  msg.textContent = "核查中…";
+  try {
+    const data = await api(`/api/schedules/${auditScheduleId}/audit`, "POST", {
+      records: pendingRecords,
+    });
+    pendingRecords = [];
+    renderPending();
+    renderAuditReport(data);
+    msg.textContent = "";
+  } catch (e) {
+    msg.textContent = "核查失败:" + e.message;
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+function renderAuditReport(data) {
+  currentAudit = data;
+  const area = $("#audit-result");
+  area.innerHTML = "";
+  const rep = data.report;
+
+  const banner = document.createElement("div");
+  banner.className = "result-banner";
+  const idTag = document.createElement("span");
+  idTag.className = "badge optimal";
+  idTag.textContent = `audit #${data.audit_id}`;
+  banner.appendChild(idTag);
+
+  const inc = document.createElement("span");
+  inc.className = `badge ${rep.incomplete ? "feasible" : "optimal"}`;
+  inc.textContent = rep.incomplete ? "不完整:存在缺测(真实余额未知)" : "完整:全部槽位已实测";
+  banner.appendChild(inc);
+
+  if (rep.over_budget) {
+    const over = document.createElement("span");
+    over.className = "badge infeasible";
+    over.textContent = "⚠ 超预算告警";
+    banner.appendChild(over);
+  }
+
+  const meta = document.createElement("div");
+  meta.className = "result-meta";
+  meta.innerHTML = `<span>排班 <b>#${data.schedule_id}</b></span><span>${data.created_at}</span>`;
+  banner.appendChild(meta);
+  area.appendChild(banner);
+
+  // ---- 逐件剂量 ----
+  const h3d = document.createElement("h3");
+  h3d.textContent = "剂量与余额上界";
+  h3d.style.fontSize = "15px";
+  area.appendChild(h3d);
+
+  const doseWrap = document.createElement("div");
+  doseWrap.className = "table-wrap";
+  const tDose = document.createElement("table");
+  tDose.innerHTML =
+    "<thead><tr><th>藏品</th><th>已测/总槽数</th><th>已测剂量 (lx·h)</th>" +
+    "<th>预算 (lx·h)</th><th>余额上界=预算−已测</th><th>计划全量剂量 (参考)</th><th>状态</th></tr></thead>";
+  const tbDose = document.createElement("tbody");
+  rep.artifacts.forEach((a) => {
+    const tr = document.createElement("tr");
+    if (a.over_budget) tr.style.background = "#fbe9e7";
+
+    const tdName = document.createElement("td");
+    tdName.appendChild(chip(a.name, colorFor(a.artifact_id, rep.artifacts.map((x) => ({ id: x.artifact_id })))));
+
+    const tdStatus = document.createElement("td");
+    const flags = [];
+    if (a.over_budget) {
+      const b = document.createElement("span");
+      b.className = "badge infeasible";
+      b.textContent = "超预算";
+      tdStatus.appendChild(b);
+      flags.push(1);
+    }
+    if (a.missing_slots.length) {
+      if (flags.length) tdStatus.appendChild(document.createTextNode(" "));
+      const b = document.createElement("span");
+      b.className = "badge unknown";
+      b.textContent = `缺测 ${a.missing_slots.length} 槽`;
+      tdStatus.appendChild(b);
+    }
+    if (!flags.length && !a.missing_slots.length) tdStatus.textContent = "正常";
+
+    const tdBal = document.createElement("td");
+    tdBal.textContent = fmtDose(a.balance_upper_bound);
+    if (a.over_budget) tdBal.style.color = "var(--bad)";
+    tdBal.style.fontWeight = "600";
+    if (a.missing_slots.length) tdBal.title = "存在缺测,真实余额 ≤ 此上界(未知)";
+
+    [tdName,
+     td(`${a.measured_count}/${a.planned_location.length}`),
+     td(fmtDose(a.measured_dose)),
+     td(fmt(a.budget)),
+     tdBal,
+     td(fmtDose(a.planned_dose)),
+     tdStatus,
+    ].forEach((c) => tr.appendChild(c));
+    tbDose.appendChild(tr);
+  });
+  tDose.appendChild(tbDose);
+  doseWrap.appendChild(tDose);
+  area.appendChild(doseWrap);
+
+  // ---- 差异与告警 ----
+  const h3f = document.createElement("h3");
+  h3f.textContent = "差异与告警(计划外展位 / 跨展位未隔库 / 缺测)";
+  h3f.style.fontSize = "15px";
+  h3f.style.marginTop = "16px";
+  area.appendChild(h3f);
+
+  rep.artifacts.forEach((a) => {
+    if (!a.deviations.length && !a.cross_booth.length && !a.missing_slots.length) return;
+    const card = document.createElement("div");
+    card.className = "audit-finding";
+    const title = document.createElement("div");
+    title.style.marginBottom = "6px";
+    title.appendChild(chip(a.name, colorFor(a.artifact_id, rep.artifacts.map((x) => ({ id: x.artifact_id })))));
+    card.appendChild(title);
+    const ul = document.createElement("ul");
+    ul.style.margin = "0";
+    ul.style.paddingLeft = "20px";
+
+    a.deviations.forEach((d) => {
+      const li = document.createElement("li");
+      li.innerHTML =
+        `<b class="audit-warn">计划外展位</b>:第 ${d.slot + 1} 槽计划在 ${locLabel(d.planned_location)},` +
+        `实测在 ${locLabel(d.actual_location)}(${fmtDose(d.lux)} lx)`;
+      ul.appendChild(li);
+    });
+    a.cross_booth.forEach((x) => {
+      const li = document.createElement("li");
+      li.innerHTML =
+        `<b class="audit-bad">跨展位未隔库</b>:第 ${x.slot + 1}→${x.slot + 2} 槽实测` +
+        ` ${locLabel(x.from_location)} → ${locLabel(x.to_location)},中间无库房间隔`;
+      ul.appendChild(li);
+    });
+    if (a.missing_slots.length) {
+      const li = document.createElement("li");
+      const slots = a.missing_slots.map((t) => t + 1).join(", ");
+      li.innerHTML = `<b class="audit-unknown">缺测(未知,不补零)</b>:第 ${slots} 槽`;
+      ul.appendChild(li);
+    }
+    card.appendChild(ul);
+    area.appendChild(card);
+  });
+  if (!rep.artifacts.some((a) =>
+    a.deviations.length || a.cross_booth.length || a.missing_slots.length)) {
+    const p = document.createElement("p");
+    p.className = "hint";
+    p.textContent = "全部槽位已实测,且与计划一致、无跨展位违规。";
+    area.appendChild(p);
+  }
+
+  // ---- 计划 vs 实测 时间轴 ----
+  const h3t = document.createElement("h3");
+  h3t.textContent = "计划 vs 实测(逐槽)";
+  h3t.style.fontSize = "15px";
+  h3t.style.marginTop = "16px";
+  area.appendChild(h3t);
+
+  const wrapT = document.createElement("div");
+  wrapT.className = "table-wrap";
+  const tableT = document.createElement("table");
+  tableT.className = "timeline";
+  const T = rep.artifacts[0] ? rep.artifacts[0].planned_location.length : 0;
+  const hr = document.createElement("tr");
+  const corner = document.createElement("th");
+  corner.className = "row-head";
+  corner.textContent = "藏品 \\ 槽";
+  hr.appendChild(corner);
+  for (let t = 0; t < T; t++) {
+    const th = document.createElement("th");
+    th.textContent = t + 1;
+    hr.appendChild(th);
+  }
+  tableT.appendChild(hr);
+
+  rep.artifacts.forEach((a) => {
+    const measured = {};
+    a.measured_slots.forEach((m) => { measured[m.slot] = m; });
+
+    const trP = document.createElement("tr");
+    const hp = document.createElement("td");
+    hp.className = "row-head";
+    hp.appendChild(chip(a.name, colorFor(a.artifact_id, rep.artifacts.map((x) => ({ id: x.artifact_id })))));
+    hp.appendChild(document.createTextNode(" 计划"));
+    trP.appendChild(hp);
+    const trM = document.createElement("tr");
+    const hm = document.createElement("td");
+    hm.className = "row-head";
+    hm.appendChild(chip(a.name, colorFor(a.artifact_id, rep.artifacts.map((x) => ({ id: x.artifact_id })))));
+    hm.appendChild(document.createTextNode(" 实测"));
+    trM.appendChild(hm);
+
+    for (let t = 0; t < T; t++) {
+      const tdP = document.createElement("td");
+      tdP.textContent = locLabel(a.planned_location[t]);
+      trP.appendChild(tdP);
+
+      const tdM = document.createElement("td");
+      const m = measured[t];
+      if (!m) {
+        tdM.className = "empty";
+        tdM.textContent = "缺测";
+        tdM.style.color = "var(--unknown)";
+      } else {
+        tdM.textContent = `${locLabel(m.location)}`;
+        if (m.location !== m.planned_location) tdM.style.background = "#fde7e4";
+      }
+      trM.appendChild(tdM);
+    }
+    tableT.appendChild(trP);
+    tableT.appendChild(trM);
+  });
+  wrapT.appendChild(tableT);
+  area.appendChild(wrapT);
+}
+
 /* ---------------- 启动 ---------------- */
 
 function renderAll() {
@@ -552,6 +987,7 @@ function renderAll() {
   renderArtifacts();
   renderLocks();
   renderSchedules();
+  renderAuditForm();
 }
 
 async function refresh() {
@@ -566,6 +1002,26 @@ async function refresh() {
 
 document.addEventListener("DOMContentLoaded", async () => {
   $("#solve-btn").addEventListener("click", solve);
+  $("#audit-submit").addEventListener("click", submitAudit);
+  $("#audit-load-btn").addEventListener("click", async () => {
+    const id = Number($("#audit-load-id").value);
+    if (!Number.isInteger(id) || id <= 0) { alert("请输入有效的 audit_id"); return; }
+    const msg = $("#audit-msg");
+    msg.textContent = "读取中…";
+    try {
+      const data = await api(`/api/audits/${id}`);
+      // 同步核查排班选择器到该报告所属排班
+      auditScheduleId = data.schedule_id;
+      if (state.schedules.some((s) => s.id === data.schedule_id)) {
+        await loadAuditSchedule(data.schedule_id);
+        await renderAuditForm();
+      }
+      renderAuditReport(data);
+      msg.textContent = "";
+    } catch (e) {
+      msg.textContent = "读取失败:" + e.message;
+    }
+  });
   await refresh();
   // 刷新后自动展示最近一次保存的排班
   if (state.schedules.length) {

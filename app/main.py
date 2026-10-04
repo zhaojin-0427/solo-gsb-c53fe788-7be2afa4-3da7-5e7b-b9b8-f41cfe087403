@@ -7,9 +7,9 @@ from typing import Literal, Optional
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, StrictFloat, StrictInt, field_validator
 
-from . import db
+from . import audit, db
 from .solver import solve_schedule
 
 SOLVE_TIME_LIMIT = 10.0  # 求解限时 10 秒
@@ -44,6 +44,26 @@ class LockIn(BaseModel):
     slot: int = Field(ge=0, le=db.MAX_SLOTS - 1)
     # 'storage'、展位序号(0 起),null 表示清除锁定
     location: Optional[Literal["storage"] | int] = None
+
+
+class AuditRecordIn(BaseModel):
+    """一条巡场实测:某藏品在某一小时槽位的实测位置与照度。"""
+    artifact_id: StrictInt
+    slot: StrictInt = Field(ge=0, le=db.MAX_SLOTS - 1)
+    # 'storage' 或快照展位序号(0 起,严格整数),取值范围按快照复核
+    location: Literal["storage"] | StrictInt
+    lux: StrictFloat = Field(ge=0)
+
+    @field_validator("lux")
+    @classmethod
+    def _lux_finite(cls, v: float) -> float:
+        if v != v or v in (float("inf"), float("-inf")):
+            raise ValueError("lux 须为有限数字")
+        return v
+
+
+class AuditIn(BaseModel):
+    records: list[AuditRecordIn] = Field(min_length=1)
 
 
 # ---------- 页面 ----------
@@ -153,6 +173,52 @@ def del_schedule(schedule_id: int) -> dict:
     if not db.delete_schedule(schedule_id):
         raise HTTPException(404, "排班不存在")
     return {"ok": True}
+
+
+# ---------- 实测核查 ----------
+
+@app.post("/api/schedules/{schedule_id}/audit", status_code=201)
+def post_audit(schedule_id: int, body: AuditIn) -> dict:
+    sched = db.get_schedule(schedule_id)
+    if sched is None:
+        raise HTTPException(404, "排班不存在")
+    # 未知 / 无 assignment / 非 optimal|feasible 一律 409:
+    # 没有可核查的计划时不接受实测记录。
+    result = sched["result"] or {}
+    if result.get("assignment") is None or sched["status"] not in ("optimal", "feasible"):
+        raise HTTPException(
+            409,
+            f"排班状态为 {sched['status']},无 optimal/feasible assignment,无法核查",
+        )
+
+    snapshot = sched["snapshot"]
+    records = [r.model_dump() for r in body.records]
+    try:
+        audit.validate_records(records, snapshot)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+
+    report = audit.build_audit_report(sched, records)
+    audit_id = db.save_audit(schedule_id, records, report)
+    return _audit_view(db.get_audit(audit_id))
+
+
+@app.get("/api/audits/{audit_id}")
+def get_audit(audit_id: int) -> dict:
+    rec = db.get_audit(audit_id)
+    if rec is None:
+        raise HTTPException(404, "核查报告不存在")
+    return _audit_view(rec)
+
+
+def _audit_view(rec: dict) -> dict:
+    return {
+        "audit_id": rec["id"],
+        "schedule_id": rec["schedule_id"],
+        "created_at": rec["created_at"],
+        "records": rec["records"],
+        "report": rec["report"],
+    }
 
 
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")

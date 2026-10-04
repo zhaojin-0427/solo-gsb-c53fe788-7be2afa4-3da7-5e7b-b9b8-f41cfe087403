@@ -143,3 +143,17 @@ tfoot td { background: #fbfaf7; }
 }
 .sched-item .meta { color: var(--muted); font-size: 13px; }
 .sched-item .spacer { flex: 1; }
+
+.audit-finding {
+  border: 1px solid var(--line);
+  border-left: 4px solid var(--warn);
+  border-radius: 8px;
+  padding: 8px 12px;
+  margin-bottom: 8px;
+  background: #fdfaf4;
+  font-size: 13px;
+}
+.audit-finding li { margin: 3px 0; }
+.audit-warn { color: var(--warn); }
+.audit-bad { color: var(--bad); }
+.audit-unknown { color: var(--unknown); }
